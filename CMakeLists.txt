@@ -24,6 +24,7 @@ endif(RELEASE)
 
 add_executable(${PROJECT_NAME}.elf
 	main.c
+	ds4bt.c
 	log.c
 )
 

@@ -23,91 +23,14 @@
 
 #define abs(x) (((x) < 0) ? -(x) : (x))
 
-struct ds4_input_report {
-	unsigned char report_id;
-	unsigned char left_x;
-	unsigned char left_y;
-	unsigned char right_x;
-	unsigned char right_y;
-
-	unsigned char dpad     : 4;
-	unsigned char square   : 1;
-	unsigned char cross    : 1;
-	unsigned char circle   : 1;
-	unsigned char triangle : 1;
-
-	unsigned char l1      : 1;
-	unsigned char r1      : 1;
-	unsigned char l2      : 1;
-	unsigned char r2      : 1;
-	unsigned char share   : 1;
-	unsigned char options : 1;
-	unsigned char l3      : 1;
-	unsigned char r3      : 1;
-
-	unsigned char ps   : 1;
-	unsigned char tpad : 1;
-	unsigned char cnt1 : 6;
-
-	unsigned char l_trigger;
-	unsigned char r_trigger;
-
-	unsigned char cnt2;
-	unsigned char cnt3;
-
-	unsigned char battery;
-
-	signed short accel_x;
-	signed short accel_y;
-	signed short accel_z;
-
-	union {
-		signed short roll;
-		signed short gyro_z;
-	};
-	union {
-		signed short yaw;
-		signed short gyro_y;
-	};
-	union {
-		signed short pitch;
-		signed short gyro_x;
-	};
-
-	unsigned char unk1[5];
-
-	unsigned char battery_level : 4;
-	unsigned char usb_plugged   : 1;
-	unsigned char headphones    : 1;
-	unsigned char microphone    : 1;
-	unsigned char padding       : 1;
-
-	unsigned char unk2[2];
-	unsigned char trackpadpackets;
-	unsigned char packetcnt;
-
-	unsigned int finger1_id        : 7;
-	unsigned int finger1_activelow : 1;
-	unsigned int finger1_x         : 12;
-	unsigned int finger1_y         : 12;
-
-	unsigned int finger2_id        : 7;
-	unsigned int finger2_activelow : 1;
-	unsigned int finger2_x         : 12;
-	unsigned int finger2_y         : 12;
-
-} __attribute__((packed, aligned(32)));
-
 static SceUID bt_mempool_uid = -1;
 static SceUID bt_thread_uid = -1;
 static SceUID bt_cb_uid = -1;
 static int bt_thread_run = 1;
 
-static int ds4_connected = 0;
+static int main_port = -1;
 static unsigned int ds4_mac0 = 0;
 static unsigned int ds4_mac1 = 0;
-
-static struct ds4_input_report ds4_input;
 
 #define DECL_FUNC_HOOK(name, ...) \
 	static tai_hook_ref_t name##_ref; \
@@ -133,23 +56,28 @@ static int set_actuator(int port, const SceCtrlActuator* pState)
 
 static int get_battery_info(int port, SceUInt8 *batt)
 {
-	if (ds4_connected && port == 1) {
-		if (ds4_input.usb_plugged) {
-			*batt = ds4_input.battery_level <= 10 ? 0xEE : 0xEF;
-		} else {
-			if (ds4_input.battery_level == 0) *batt = 0;
-			else *batt = (ds4_input.battery_level / 2) + 1;
-			if (*batt > 5) *batt = 5;
-		}
-		return 0;
+	ds4_controller *ds4 = get_ds4_controller(port);
+	if (ds4 == NULL) {
+		return 0x80340021;
 	}
-	return 0x80340021;
+	if (ds4->report->usb_plugged) {
+		*batt = ds4->report->battery_level <= 10 ? 0xEE : 0xEF;
+	} else {
+		if (ds4->report->battery_level == 0) *batt = 0;
+		else *batt = (ds4->report->battery_level / 2) + 1;
+		if (*batt > 5) *batt = 5;
+	}
+	return 0;
 }
 
 static int disconnect(int port)
 {
-	// TODO
-	return 0x80340021;
+	ds4_controller *ds4 = get_ds4_controller(port);
+	if (ds4 == NULL) {
+		return 0x80340021;
+	}
+	ksceBtStartDisconnect(ds4->mac[0], ds4->mac[1]);
+	return 0;
 }
 
 static int set_turnoff_interval(int port)
@@ -160,16 +88,18 @@ static int set_turnoff_interval(int port)
 
 static int get_active_controller_port(void)
 {
-	if (ds4_connected) {
-		return 1;
+	if (main_port < 0) {
+		return 0x80340021;
 	}
-	return 0x80340021;
+	return main_port;
 }
 
-static int change_port_assign(int port1, int port2)
+static int change_port_assign(int port0, int port1)
 {
-	// TODO
-	return 0x80340001;
+	if (ds4_controller_swap(port0, port1) < 0) {
+		return 0x80340001;
+	}
+	return 0;
 }
 
 int unk0(void) {
@@ -180,38 +110,43 @@ static int get_controller_port_info(SceCtrlPortInfo *info)
 {
 	memset(info, 0, sizeof(SceCtrlPortInfo));
 	info->port[0] = SCE_CTRL_TYPE_PHY;
-	if (ds4_connected) {
-		// info->port[0] |= SCE_CTRL_TYPE_VIRT;
-		info->port[1] = SCE_CTRL_TYPE_DS4;
+	for (int i = 1; i <= DS4_LIST_MAX_SIZE; i++) {
+		ds4_controller *ds4 = get_ds4_controller(i);
+		if (!ds4)
+			continue;
+		info->port[i] = SCE_CTRL_TYPE_DS4;
 	}
 	return 0;
 };
 
 static int set_light_bar(int port, SceUInt8 r, SceUInt8 g, SceUInt8 b)
 {
-	if (!ds4_connected || port != 1) {
+	ds4_controller *ds4 = get_ds4_controller(port);
+	if (ds4 == NULL) {
 		return 0x80340021;
 	}
 
-	return ds4_send_0x11_report_with_custom_rgb(ds4_mac0, ds4_mac1, r, g, b);
+	return ds4_send_0x11_report_with_custom_rgb(ds4->mac[0], ds4->mac[1], r, g, b);
 };
 
 static int reset_light_bar(int port)
 {
-	if (!ds4_connected || port != 1) {
+	ds4_controller *ds4 = get_ds4_controller(port);
+	if (ds4 == NULL) {
 		return 0x80340021;
 	}
 
-	return ds4_send_0x11_report_with_custom_rgb(ds4_mac0, ds4_mac1, 0xFF, 0x00, 0xFF);
+	return ds4_send_0x11_report_with_custom_rgb(ds4->mac[0], ds4->mac[1], 0xFF, 0x00, 0xFF);
 };
 
 static int single_controller_mode(int port)
 {
-	if (!ds4_connected || port != 1) {
+	ds4_controller *ds4 = get_ds4_controller(port);
+	if (ds4 == NULL) {
 		return 0x80340021;
 	}
 
-	// TODO
+	main_port = port;
 	return 0;
 }
 
@@ -219,7 +154,7 @@ int unk1(int port) {
 	return 0;
 }
 
-static SceCtrlVirtualControllerDriver driver = {
+SceCtrlVirtualControllerDriver driver = {
 	.readButtons = read_buttons,
 	.setActuator = set_actuator,
 	.getBatteryInfo = get_battery_info,
@@ -234,11 +169,6 @@ static SceCtrlVirtualControllerDriver driver = {
 	.unk1 = unk1,
 	.singleControllerMode = single_controller_mode,
 };
-
-static inline void ds4_input_reset(void)
-{
-	memset(&ds4_input, 0, sizeof(ds4_input));
-}
 
 static int is_ds4(const unsigned short vid_pid[2])
 {
@@ -320,7 +250,7 @@ static int ds4_send_0x11_report(unsigned int mac0, unsigned int mac1)
 	return ds4_send_0x11_report_with_custom_rgb(mac0, mac1, 0xFF, 0x00, 0xFF);
 }
 
-static void reset_input_emulation()
+void reset_input_emulation()
 {
 	ksceCtrlSetButtonEmulation(0, 0, 0, 0, 32);
 	ksceCtrlSetAnalogEmulation(0, 0, 0x80, 0x80, 0x80, 0x80,
@@ -418,43 +348,126 @@ static void patch_analogdata(int port, SceCtrlData *pad_data, int count,
 	}
 }
 
+static void patch_button_and_analogdata(int port, SceCtrlData *pad_data, int count,
+			    struct ds4_input_report *ds4) {
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		SceCtrlData k_data;
+
+		ksceKernelMemcpyUserToKernel(&k_data, (uintptr_t)pad_data, sizeof(k_data));
+
+		if (ds4->cross)
+			k_data.buttons |= SCE_CTRL_CROSS;
+		if (ds4->circle)
+			k_data.buttons |= SCE_CTRL_CIRCLE;
+		if (ds4->triangle)
+			k_data.buttons |= SCE_CTRL_TRIANGLE;
+		if (ds4->square)
+			k_data.buttons |= SCE_CTRL_SQUARE;
+
+		if (ds4->dpad == 0 || ds4->dpad == 1 || ds4->dpad == 7)
+			k_data.buttons |= SCE_CTRL_UP;
+		if (ds4->dpad == 1 || ds4->dpad == 2 || ds4->dpad == 3)
+			k_data.buttons |= SCE_CTRL_RIGHT;
+		if (ds4->dpad == 3 || ds4->dpad == 4 || ds4->dpad == 5)
+			k_data.buttons |= SCE_CTRL_DOWN;
+		if (ds4->dpad == 5 || ds4->dpad == 6 || ds4->dpad == 7)
+			k_data.buttons |= SCE_CTRL_LEFT;
+
+		if (ds4->l1)
+			k_data.buttons |= SCE_CTRL_L1;
+		if (ds4->r1)
+			k_data.buttons |= SCE_CTRL_R1;
+
+		if (ds4->l2)
+			k_data.buttons |= SCE_CTRL_LTRIGGER;
+		if (ds4->r2)
+			k_data.buttons |= SCE_CTRL_RTRIGGER;
+
+		if (ds4->l3)
+			k_data.buttons |= SCE_CTRL_L3;
+		if (ds4->r3)
+			k_data.buttons |= SCE_CTRL_R3;
+
+		if (ds4->share)
+			k_data.buttons |= SCE_CTRL_SELECT;
+		if (ds4->options)
+			k_data.buttons |= SCE_CTRL_START;
+		if (ds4->ps)
+			k_data.buttons |= SCE_CTRL_INTERCEPTED;
+
+		if (abs(ds4->left_x - 128) > DS4_ANALOG_THRESHOLD)
+			k_data.lx = ds4->left_x;
+		if (abs(ds4->left_y - 128) > DS4_ANALOG_THRESHOLD)
+			k_data.ly = ds4->left_y;
+		if (abs(ds4->right_x - 128) > DS4_ANALOG_THRESHOLD)
+			k_data.rx = ds4->right_x;
+		if (abs(ds4->right_y - 128) > DS4_ANALOG_THRESHOLD)
+			k_data.ry = ds4->right_y;
+		if (ds4->l_trigger > DS4_ANALOG_THRESHOLD)
+			k_data.lt = ds4->l_trigger;
+		if (ds4->r_trigger > DS4_ANALOG_THRESHOLD)
+			k_data.rt = ds4->r_trigger;
+		ksceKernelMemcpyKernelToUser((uintptr_t)pad_data, &k_data, sizeof(k_data));
+
+		pad_data++;
+	}
+}
+
 DECL_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositive2, int port, SceCtrlData *pad_data, int count)
 {
 	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositive2_ref, port, pad_data, count);
-
-	if (ret >= 0 && ds4_connected)
-		patch_analogdata(port, pad_data, count, &ds4_input);
-
+	ds4_controller *ds4 = get_ds4_controller(port == 0 ? main_port : port);
+	if (ret >= 0 && ds4) {
+		if (port == 0) {
+			patch_analogdata(port, pad_data, count, ds4->report);
+		} else {
+			patch_button_and_analogdata(port, pad_data, count, ds4->report);
+		}
+	}
 	return ret;
 }
 
 DECL_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositive2, int port, SceCtrlData *pad_data, int count)
 {
 	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositive2_ref, port, pad_data, count);
-
-	if (ret >= 0 && ds4_connected)
-		patch_analogdata(port, pad_data, count, &ds4_input);
-
+	ds4_controller *ds4 = get_ds4_controller(port == 0 ? main_port : port);
+	if (ret >= 0 && ds4) {
+		if (port == 0) {
+			patch_analogdata(port, pad_data, count, ds4->report);
+		} else {
+			patch_button_and_analogdata(port, pad_data, count, ds4->report);
+		}
+	}
 	return ret;
 }
 
 DECL_FUNC_HOOK(SceCtrl_sceCtrlPeekBufferPositiveExt2, int port, SceCtrlData *pad_data, int count)
 {
 	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlPeekBufferPositiveExt2_ref, port, pad_data, count);
-
-	if (ret >= 0 && ds4_connected)
-		patch_analogdata(port, pad_data, count, &ds4_input);
-
+	ds4_controller *ds4 = get_ds4_controller(port == 0 ? main_port : port);
+	if (ret >= 0 && ds4) {
+		if (port == 0) {
+			patch_analogdata(port, pad_data, count, ds4->report);
+		} else {
+			patch_button_and_analogdata(port, pad_data, count, ds4->report);
+		}
+	}
 	return ret;
 }
 
 DECL_FUNC_HOOK(SceCtrl_sceCtrlReadBufferPositiveExt2, int port, SceCtrlData *pad_data, int count)
 {
 	int ret = TAI_CONTINUE(int, SceCtrl_sceCtrlReadBufferPositiveExt2_ref, port, pad_data, count);
-
-	if (ret >= 0 && ds4_connected)
-		patch_analogdata(port, pad_data, count, &ds4_input);
-
+	ds4_controller *ds4 = get_ds4_controller(port == 0 ? main_port : port);
+	if (ret >= 0 && ds4) {
+		if (port == 0) {
+			patch_analogdata(port, pad_data, count, ds4->report);
+		} else {
+			patch_button_and_analogdata(port, pad_data, count, ds4->report);
+		}
+	}
 	return ret;
 }
 
@@ -496,8 +509,9 @@ DECL_FUNC_HOOK(SceTouch_ksceTouchPeek, SceUInt32 port, SceTouchData *pData, SceU
 {
 	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchPeek_ref, port, pData, nBufs);
 
-	if (ret >= 0 && ds4_connected)
-		patch_touchdata(port, pData, nBufs, &ds4_input);
+	ds4_controller *ds4 = get_ds4_controller(main_port);
+	if (ret >= 0 && ds4)
+		patch_touchdata(port, pData, nBufs, ds4->report);
 
 	return ret;
 }
@@ -506,8 +520,9 @@ DECL_FUNC_HOOK(SceTouch_ksceTouchPeekRegion, SceUInt32 port, SceTouchData *pData
 {
 	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchPeekRegion_ref, port, pData, nBufs, region);
 
-	if (ret >= 0 && ds4_connected)
-		patch_touchdata(port, pData, nBufs, &ds4_input);
+	ds4_controller *ds4 = get_ds4_controller(main_port);
+	if (ret >= 0 && ds4)
+		patch_touchdata(port, pData, nBufs, ds4->report);
 
 	return ret;
 }
@@ -516,8 +531,9 @@ DECL_FUNC_HOOK(SceTouch_ksceTouchRead, SceUInt32 port, SceTouchData *pData, SceU
 {
 	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchRead_ref, port, pData, nBufs);
 
-	if (ret >= 0 && ds4_connected)
-		patch_touchdata(port, pData, nBufs, &ds4_input);
+	ds4_controller *ds4 = get_ds4_controller(main_port);
+	if (ret >= 0 && ds4)
+		patch_touchdata(port, pData, nBufs, ds4->report);
 
 	return ret;
 }
@@ -526,8 +542,9 @@ DECL_FUNC_HOOK(SceTouch_ksceTouchReadRegion, SceUInt32 port, SceTouchData *pData
 {
 	int ret = TAI_CONTINUE(int, SceTouch_ksceTouchReadRegion_ref, port, pData, nBufs, region);
 
-	if (ret >= 0 && ds4_connected)
-		patch_touchdata(port, pData, nBufs, &ds4_input);
+	ds4_controller *ds4 = get_ds4_controller(main_port);
+	if (ret >= 0 && ds4)
+		patch_touchdata(port, pData, nBufs, ds4->report);
 
 	return ret;
 }
@@ -548,8 +565,9 @@ DECL_FUNC_HOOK(SceMotion_sceMotionGetState, SceMotionState *motionState)
 {
 	int ret = TAI_CONTINUE(int, SceMotion_sceMotionGetState_ref, motionState);
 
-	if (ret >= 0 && ds4_connected)
-		patch_motion_state(motionState, &ds4_input);
+	ds4_controller *ds4 = get_ds4_controller(0);
+	if (ret >= 0 && ds4)
+		patch_motion_state(motionState, ds4->report);
 
 	return ret;
 }
@@ -593,13 +611,14 @@ DECL_FUNC_HOOK(SceBt_sub_22999C8, void *dev_base_ptr, int r1)
 
 DECL_FUNC_HOOK(SceCtrl_sub_17C107C, int port, SceCtrlData *pad_data, int count)
 {
-	if (!ds4_connected) {
-		return TAI_CONTINUE(int, SceCtrl_sub_17C107C_ref, port, pad_data, count);
+	if (port == 0 && ds4_num_connected) {
+		ksceCtrlRegisterVirtualControllerDriver(NULL);
+		int ret = TAI_CONTINUE(int, SceCtrl_sub_17C107C_ref, port, pad_data, count);
+		ksceCtrlRegisterVirtualControllerDriver(&driver);
+		return ret;
 	}
-	ksceCtrlRegisterVirtualControllerDriver(NULL);
-	int ret = TAI_CONTINUE(int, SceCtrl_sub_17C107C_ref, port, pad_data, count);
-	ksceCtrlRegisterVirtualControllerDriver(&driver);
-	return ret;
+	return TAI_CONTINUE(int, SceCtrl_sub_17C107C_ref, port, pad_data, count);
+
 }
 
 static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common)
@@ -630,16 +649,16 @@ static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common
 		 * If we get an event with a MAC, and the MAC is different
 		 * from the connected DS4, skip the event.
 		 */
-		if (ds4_connected) {
-			if (hid_event.mac0 != ds4_mac0 || hid_event.mac1 != ds4_mac1)
-				continue;
+		unsigned mac[2] = {hid_event.mac0, hid_event.mac1};
+		int port = ds4_mac_to_port(mac);
+		if (port < 0 && hid_event.id > 0x05) {
+			continue;
 		}
 
 		switch (hid_event.id) {
 		case 0x01: { /* Inquiry result event */
 			unsigned short vid_pid[2];
 			ksceBtGetVidPid(hid_event.mac0, hid_event.mac1, vid_pid);
-
 			if (is_ds4(vid_pid)) {
 				ksceBtStopInquiry();
 				ds4_mac0 = hid_event.mac0;
@@ -648,38 +667,58 @@ static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common
 			break;
 		}
 
-		case 0x02: /* Inquiry stop event */
-			if (!ds4_connected) {
-				if (ds4_mac0 || ds4_mac1)
-					ksceBtStartConnect(ds4_mac0, ds4_mac1);
-			}
+		case 0x02: { /* Inquiry stop event */
+			if (port < 0 && (ds4_mac0 || ds4_mac1))
+				ksceBtStartConnect(ds4_mac0, ds4_mac1);
 			break;
+		}
 
 		case 0x04: /* Link key request? event */
-			ksceBtReplyUserConfirmation(hid_event.mac0, hid_event.mac1, 1);
+			if (hid_event.mac0 == ds4_mac0 && hid_event.mac1 == ds4_mac1)
+				ksceBtReplyUserConfirmation(hid_event.mac0, hid_event.mac1, 1);
 			break;
 
 		case 0x05: { /* Connection accepted event */
 			unsigned short vid_pid[2];
 			ksceBtGetVidPid(hid_event.mac0, hid_event.mac1, vid_pid);
-
 			if (is_ds4(vid_pid)) {
-				ds4_input_reset();
-				ds4_mac0 = hid_event.mac0;
-				ds4_mac1 = hid_event.mac1;
-				ds4_connected = 1;
+				unsigned int mac[2] = { hid_event.mac0, hid_event.mac1 };
+				int p = ds4_controller_list_insert(mac);
+				ds4_mac0 = 0;
+				ds4_mac1 = 0;
+				if (p < 0) {
+					// maybe already max
+					ksceBtStartDisconnect(hid_event.mac0, hid_event.mac1);
+					break;
+				}
+				if (main_port < 0)
+					main_port = p;
 				ds4_send_0x11_report(hid_event.mac0, hid_event.mac1);
-				ksceCtrlRegisterVirtualControllerDriver(&driver);
 			}
 			break;
 		}
 
+		case 0x06: { /* Device disconnect event*/
+			ds4_controller_list_remove(port);
+			// TODO check single mode and main port
+			if (port != main_port) {
+				break;
+			}
 
-		case 0x06: /* Device disconnect event*/
-			ds4_connected = 0;
 			reset_input_emulation();
-			ksceCtrlRegisterVirtualControllerDriver(NULL);
+
+			if (ds4_num_connected == 0) {
+				main_port = -1;
+				break;
+			}
+
+			for (int i = 1; i <= DS4_LIST_MAX_SIZE; i++) {
+				if (i != port && get_ds4_controller(i)) {
+					main_port = i;
+				}
+			}
 			break;
+		}
 
 		case 0x08: /* Connection requested event */
 			/*
@@ -699,14 +738,19 @@ static int bt_cb_func(int notifyId, int notifyCount, int notifyArg, void *common
 			LOG("DS4 0x0A event: 0x%02X\n", recv_buff[0]);
 
 			switch (recv_buff[0]) {
-			case 0x11:
-				memcpy(&ds4_input, recv_buff, sizeof(ds4_input));
+			case 0x11: {
+				ds4_controller *ds4 = get_ds4_controller(port);
+				if (ds4 == NULL) {
+					break;
+				}
+				memcpy(ds4->report, recv_buff, sizeof(*ds4->report));
 
-				set_input_emulation(&ds4_input);
+				set_input_emulation(ds4->report);
 
 				enqueue_read_request(hid_event.mac0, hid_event.mac1,
 					&hid_request, recv_buff, sizeof(recv_buff));
 				break;
+			}
 
 			default:
 				LOG("Unknown DS4 event: 0x%02X\n", recv_buff[0]);
@@ -745,10 +789,15 @@ static int ds4vita_bt_thread(SceSize args, void *argp)
 		ksceKernelDelayThreadCB(200 * 1000);
 	}
 
-	if (ds4_connected) {
-		ksceBtStartDisconnect(ds4_mac0, ds4_mac1);
-		reset_input_emulation();
+	for (int i = 1; i <= DS4_LIST_MAX_SIZE; i++) {
+		ds4_controller *ds4 = get_ds4_controller(i);
+		if (!ds4) {
+			continue;
+		}
+
+		ksceBtStartDisconnect(ds4->mac[0], ds4->mac[1]);
 	}
+	reset_input_emulation();
 
 	ksceBtUnregisterCallback(bt_cb_uid);
 
@@ -845,6 +894,8 @@ int module_start(SceSize argc, const void *args)
 	opt.field_14 = 0;
 	opt.field_18 = 0;
 
+	ds4_controller_list_init();
+
 	bt_mempool_uid = ksceKernelCreateHeap("ds4vita_mempool", 0x100, &opt);
 	LOG("Bluetooth mempool UID: 0x%08X\n", bt_mempool_uid);
 
@@ -885,9 +936,10 @@ int module_stop(SceSize argc, const void *args)
 		ksceKernelDeleteThread(bt_thread_uid);
 	}
 
-	if (bt_mempool_uid > 0) {
-		ksceKernelDeleteHeap(bt_mempool_uid);
+	for (int port = 1; port <= DS4_LIST_MAX_SIZE; port++) {
+		ds4_controller_list_remove(port);
 	}
+	ds4_controller_list_fini();
 
 	UNBIND_FUNC_HOOK(SceBt_sub_22999C8);
 	UNPATCH_DATA(SceCtrl_ksceCtrlRegisterVirtualControllerDriver);
